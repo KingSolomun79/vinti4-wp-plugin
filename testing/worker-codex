@@ -1,3 +1,30 @@
+
+Your evaluation is largely correct and aligns with the official Vinti4 WordPress plugin and SISP documentation.  Here are the key validations based on the plugin’s source code and accompanying docs:
+
+* **Fingerprint construction** – The plugin’s `GerarFingerPrintEnvio` function concatenates `base64(sha512(posAuthCode))`, `timestamp`, `amount×1000`, `merchantRef`, `merchantSession`, `posID`, `currency`, `transactionCode`, `entityCode` and `referenceNumber`, then hashes the result and Base64‑encodes it.  The response fingerprint uses a completely different field order and also multiplies the purchase amount by 1000.  This confirms that your skeleton’s placeholder fingerprint logic is incomplete; you need two separate functions for send and response fingerprints.
+
+* **Purchase request field** – In `postback.php`, the plugin builds a `purchaseRequest` JSON with customer account and address information and Base64‑encodes it.  This field is required for EMV 3DS 2.2 transactions.  The PRD and skeleton need to incorporate this field and derive country and subdivision codes (using ISO‑3166), default postal codes, account age indicators and phone country codes.
+
+* **Callback fields and validation** – SISP’s callback posts fields such as `merchantRespMerchantRef`, `merchantRespMerchantSession`, `merchantRespTid`, `merchantRespCP`, `merchantRespPurchaseAmount`, `merchantRespMessageID`, `merchantRespPan`, `merchantResp` and `messageType`.  There is no `orderId` field; your Worker must look up the session using `merchantRespMerchantRef`.  Success requires `messageType` ∈ {8, 10, P, M} and `merchantResp = C`; the plugin already checks `messageType` but does not validate `merchantResp`.  The Worker should also verify that the received amount matches the expected amount.  Fingerprint mismatch or amount mismatch should log an error and mark the session as failed.
+
+* **Transaction status API** – The separate API for querying transaction status uses HTTP Basic authentication with a portal ID and password (distinct from `posAuthCode`), and the request body includes `posID`, `posAuthCode` and `merchantRef`.  Your PRD’s `/transaction-status?sessionId=` endpoint needs to retrieve the `merchantRef` from D1 and call SISP accordingly.  Keep these credentials separate from the payment credentials.
+
+* **Amount handling** – Although Cape Verde escudo (CVE) has no decimals, SISP requires amounts multiplied by 1000 when calculating fingerprints.  The Worker should store and send amounts as integer CVE and only multiply by 1000 internally for the fingerprint calculation.
+
+* **Token payments** – Tokenization and token payments are phase‑two features; per the tokenization specification, token payments use `transactionCode = 6`, token creation uses `transactionCode = 5` and cancellation uses `transactionCode = 7`.  Incorporating this into the PRD will prevent mismatches when implementing recurring payments.
+
+In light of these findings, your PRD should be amended to include:
+
+1. Two fingerprint functions (send and response) with the exact field orders shown above.
+2. A mandatory `purchaseRequest` field containing EMV 3DS 2.2 customer data.
+3. Proper handling of callback fields and separate checks for `messageType` and `merchantResp`.
+4. A distinct transaction‑status API with Basic auth.
+5. Clarification on amount scaling and transaction codes for token operations.
+
+To help you validate your implementation, I’ve prepared a comprehensive testing plan that covers cryptographic primitives, fingerprint functions, purchaseRequest encoding, request construction, callback handling, transaction status, token flows, environment setup, caveats and logging.  You can download the test plan here: {{file:file-U7WCbFJZ2JoD7gNg9rbDo1}}.  Following this plan will ensure that your Worker behaves exactly as SISP expects and that any errors are logged with sufficient detail to diagnose problems.
+
+
+
 Comprehensive Testing Guide for Vinti4 Worker Integration
 
 This guide walks you through setting up your environment, installing the necessary tools, and executing a comprehensive suite of tests for the Vinti4 payment Worker. It is designed for users without deep coding knowledge—each step includes explicit commands and explanations, along with tips to diagnose problems when they occur.
