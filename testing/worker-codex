@@ -1,0 +1,590 @@
+
+
+* **Fingerprint construction** – The plugin’s `GerarFingerPrintEnvio` function concatenates `base64(sha512(posAuthCode))`, `timestamp`, `amount×1000`, `merchantRef`, `merchantSession`, `posID`, `currency`, `transactionCode`, `entityCode` and `referenceNumber`, then hashes the result and Base64‑encodes it.  The response fingerprint uses a completely different field order and also multiplies the purchase amount by 1000.  This confirms that your skeleton’s placeholder fingerprint logic is incomplete; you need two separate functions for send and response fingerprints.
+
+* **Purchase request field** – In `postback.php`, the plugin builds a `purchaseRequest` JSON with customer account and address information and Base64‑encodes it.  This field is required for EMV 3DS 2.2 transactions.  The PRD and skeleton need to incorporate this field and derive country and subdivision codes (using ISO‑3166), default postal codes, account age indicators and phone country codes.
+
+* **Callback fields and validation** – SISP’s callback posts fields such as `merchantRespMerchantRef`, `merchantRespMerchantSession`, `merchantRespTid`, `merchantRespCP`, `merchantRespPurchaseAmount`, `merchantRespMessageID`, `merchantRespPan`, `merchantResp` and `messageType`.  There is no `orderId` field; your Worker must look up the session using `merchantRespMerchantRef`.  Success requires `messageType` ∈ {8, 10, P, M} and `merchantResp = C`; the plugin already checks `messageType` but does not validate `merchantResp`.  The Worker should also verify that the received amount matches the expected amount.  Fingerprint mismatch or amount mismatch should log an error and mark the session as failed.
+
+* **Transaction status API** – The separate API for querying transaction status uses HTTP Basic authentication with a portal ID and password (distinct from `posAuthCode`), and the request body includes `posID`, `posAuthCode` and `merchantRef`.  Your PRD’s `/transaction-status?sessionId=` endpoint needs to retrieve the `merchantRef` from D1 and call SISP accordingly.  Keep these credentials separate from the payment credentials.
+
+* **Amount handling** – Although Cape Verde escudo (CVE) has no decimals, SISP requires amounts multiplied by 1000 when calculating fingerprints.  The Worker should store and send amounts as integer CVE and only multiply by 1000 internally for the fingerprint calculation.
+
+* **Token payments** – Tokenization and token payments are phase‑two features; per the tokenization specification, token payments use `transactionCode = 6`, token creation uses `transactionCode = 5` and cancellation uses `transactionCode = 7`.  Incorporating this into the PRD will prevent mismatches when implementing recurring payments.
+
+In light of these findings, your PRD should be amended to include:
+
+1. Two fingerprint functions (send and response) with the exact field orders shown above.
+2. A mandatory `purchaseRequest` field containing EMV 3DS 2.2 customer data.
+3. Proper handling of callback fields and separate checks for `messageType` and `merchantResp`.
+4. A distinct transaction‑status API with Basic auth.
+5. Clarification on amount scaling and transaction codes for token operations.
+
+To help you validate your implementation, I’ve prepared a comprehensive testing plan that covers cryptographic primitives, fingerprint functions, purchaseRequest encoding, request construction, callback handling, transaction status, token flows, environment setup, caveats and logging.  You can download the test plan here: {{file:file-U7WCbFJZ2JoD7gNg9rbDo1}}.  Following this plan will ensure that your Worker behaves exactly as SISP expects and that any errors are logged with sufficient detail to diagnose problems.
+
+
+
+Comprehensive Testing Guide for Vinti4 Worker Integration
+
+This guide walks you through setting up your environment, installing the necessary tools, and executing a comprehensive suite of tests for the Vinti4 payment Worker. It is designed for users without deep coding knowledge—each step includes explicit commands and explanations, along with tips to diagnose problems when they occur.
+
+1. Overview
+
+The goal of the test process is to verify that your new Cloudflare Worker correctly implements the Vinti4 payment flows—computing fingerprints, building requests, handling callbacks, and querying transaction status—according to the specification and the reference WordPress plugin. By following this guide, you’ll catch most implementation errors before deploying to production.
+
+2. Prerequisites
+
+Before running any tests, ensure you have the following:
+
+Requirement	Purpose	Installation
+A computer with macOS, Linux or Windows	The testing environment.	N/A
+Internet connection	Needed to install packages and, later, to connect to Cloudflare or SISP test endpoints.	N/A
+Node.js (version ≥ 18)	Required to run scripts, tests and the Worker locally. Node includes the npm package manager.	See below for installation.
+Git	To clone the repository containing the Worker code (optional if you download a ZIP).	Install Git
+
+Cloudflare account (optional for local tests)	Needed only if you deploy to Cloudflare’s edge or use wrangler to simulate production.	Sign up here
+
+Postman or curl	For sending HTTP requests to your local Worker during testing. Postman offers a graphical UI; curl is a command‑line tool.	Postman: Download
+; curl is preinstalled on most systems.
+Text editor	To view or edit configuration files. Use Visual Studio Code, Sublime Text or any plain text editor.	Visual Studio Code
+ recommended.
+2.1 Installing Node.js
+
+Check Node version: open a terminal or Command Prompt and run:
+
+node --version
+
+If you see a version number like v18.17.0 or higher, Node is already installed. If you get “command not found” or the version is below 18, install Node.
+
+Install using Node Version Manager (recommended):
+
+On macOS or Linux, install nvm by running:
+
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.4/install.sh | bash
+# Then restart your terminal and install Node 18 LTS
+nvm install 18
+nvm use 18
+
+On Windows, download the Node.js LTS installer from nodejs.org
+ and run it. Make sure to tick “Automatically install the necessary tools”.
+
+2.2 Installing the Worker project
+
+Clone or download the repository that contains the Worker code. If you cloned using Git:
+
+git clone https://github.com/your-org/vinti4-worker.git
+cd vinti4-worker
+
+If you don’t have Git, download the ZIP file from your project hosting platform, extract it, and open the extracted folder in a terminal.
+
+Install dependencies using npm:
+
+npm install
+
+This command reads the package.json file and installs required packages (e.g., Jest for testing, Cloudflare Wrangler, etc.).
+
+Install Cloudflare Wrangler (optional): The wrangler CLI allows you to run Workers locally and deploy to Cloudflare. Install it globally:
+
+npm install -g wrangler
+
+Verify installation with:
+
+wrangler --version
+
+Set up environment variables: Create a file named .env in the project root with your POS credentials and any other secrets. For example:
+
+POS_ID=20314869
+POS_AUTH_CODE=ttqRdOzmGvCSpuag
+CALLBACK_URL=https://your-worker-domain.com/callback
+PORTAL_ID=your-portal-id
+PORTAL_PASSWORD=your-portal-password
+
+Never commit this file to version control. It should be used only in development.
+
+(Optional) Configure Wrangler: run wrangler login and follow the instructions to authenticate with Cloudflare. This step is only needed if you plan to deploy the Worker to Cloudflare or use wrangler dev to bind D1 databases.
+3. Running the Unit Tests
+
+Unit tests verify your fingerprint and helper functions without making network requests. They run quickly and catch most errors early.
+
+Execute all tests:
+
+npm test
+
+This command uses Jest (or the testing framework specified in package.json) to run all test files in the test directory. The provided test suite should include tests for:
+
+sha512Base64 – verifying the raw SHA‑512 + Base64 behaviour.
+buildSendFingerprint – checking that the send fingerprint matches known examples from the specification.
+buildResponseFingerprint – checking the success and error fingerprints against known values.
+
+If a test fails, read the failure message. Usually it will show the expected output and the actual output. Make sure you’ve implemented the functions exactly as specified.
+
+Troubleshooting:
+If sha512Base64 fails, verify that you’re using the raw digest, not the hex string. The length of a SHA‑512 digest should be 64 bytes (128 hex characters), but Base64 output should be 88 characters.
+If the send fingerprint test fails, ensure you multiply the amount by 1000 and remove whitespace. Check the concatenation order.
+If the response fingerprint test fails, double‑check the order of fields, strip leading zeros from CP and TID, and trim whitespace.
+4. Running the Worker Locally
+
+You can simulate the Worker on your own machine using either the Node.js entry point (if provided) or Cloudflare Wrangler. The steps below use Wrangler.
+
+Start the Worker in development mode:
+
+wrangler dev
+
+By default, this serves the Worker on http://localhost:8787. The console output will show the port; if it differs, use that.
+
+Observe logs: Wrangler prints console logs from your Worker. When sending requests, watch this terminal for fingerprint comparison results, error messages and session updates.
+5. Testing the /create-payment endpoint
+5.1 Sending a payment request
+
+Prepare a sample order. You’ll need an order ID, amount (integer CVE), and customer data. For example:
+
+{
+  "orderId": "12345",
+  "amount": 5000,
+  "customer": {
+    "email": "alice@example.com",
+    "phone": "+238 9988776",
+    "billingAddress1": "Avenida Cidade",
+    "billingCity": "Praia",
+    "billingCountryAlpha2": "CV",
+    "billingPostcode": "0000"
+  },
+  "locale": "pt"
+}
+
+Use Postman or curl to POST to /create-payment:
+
+With Postman:
+
+Create a new POST request to http://localhost:8787/create-payment.
+Select Body > raw and choose JSON. Paste the JSON above.
+Send the request. You should see a response containing an HTML form. In most cases, the Worker will return a 200 with an HTML body that auto‑submits. To view it, click Preview in Postman.
+
+With curl:
+
+curl -X POST http://localhost:8787/create-payment \
+  -H "Content-Type: application/json" \
+  -d '{"orderId":"12345","amount":5000,"customer":{"email":"alice@example.com","phone":"+238 9988776","billingAddress1":"Avenida Cidade","billingCity":"Praia","billingCountryAlpha2":"CV","billingPostcode":"0000"},"locale":"pt"}'
+
+The response will be the auto‑submit HTML. Save it to a file if you wish to inspect the hidden fields.
+
+Check the logs: In the terminal where wrangler dev is running, you should see logs indicating the generated fingerprint and the URL used for the SISP POST. If the fingerprint looks strange (for example, it is null or very short), there may be a bug in the algorithm.
+5.2 Common issues
+Missing fields: If the response from /create-payment contains an error about missing fields, ensure your request body includes orderId, amount and the required customer details. Use integer CVE for amount, not a string or decimal.
+Fingerprint mismatch: If you later see a mismatch at the callback stage, confirm that the Worker uses the same values sent to SISP when computing the fingerprint. Logging the values helps you diagnose this.
+6. Testing the /callback endpoint
+
+SISP will normally call your /callback endpoint after the customer completes the payment. To test this locally, simulate SISP’s POST using your own data.
+
+6.1 Simulating a success callback
+
+Generate a valid callback payload: Use the same values you provided in /create-payment and compute the response fingerprint using your buildResponseFingerprint function. For example:
+
+node scripts/build-callback.js --autCode ttqRdOzmGvCSpuag --messageType 8 --cp 0001 --tid 0012 --ref R20240510153000 --sess R20240510153000 --amount 5000 --msgId TESTMSGID --pan "************1234" --resp C --timestamp "2024-05-10 15:35:00" --reference "" --entity "" --receipt "REC123" --additional "" --reloadCode "000000000000"
+
+The script should output a JSON or URL‑encoded body and the fingerprint. If you don’t have such a script, you can write one or manually assemble the payload.
+
+Send the POST:
+
+curl -X POST http://localhost:8787/callback \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "messageType=8&merchantRespCP=0001&merchantRespTid=0012&merchantRespMerchantRef=R20240510153000&merchantRespMerchantSession=R20240510153000&merchantRespPurchaseAmount=5000&merchantRespMessageID=TESTMSGID&merchantRespPan=************1234&merchantResp=C&merchantRespTimeStamp=2024-05-10%2015:35:00&merchantRespReferenceNumber=&merchantRespEntityCode=&merchantRespClientReceipt=REC123&merchantRespAdditionalErrorMessage=&merchantRespReloadCode=000000000000&resultFingerPrint=YOUR_COMPUTED_FINGERPRINT&resultFingerPrintVersion=1"
+Observe logs: The Worker should log whether the fingerprint matched and whether the amount matched. If both match, it should mark the session as successful and (optionally) send a notification to WooCommerce asynchronously. If anything doesn’t match, it should log the mismatch and mark the session as failed.
+6.2 Simulating an error callback
+Change merchantResp to D and messageType to 10 or 6 and compute a new fingerprint. Send this POST to /callback.
+Verify that the Worker logs the error and does not update the order or session to success. The session should be marked as failed or denied.
+6.3 Caveats
+Order lookup: The Worker uses merchantRespMerchantRef to find the session and associated WooCommerce order, not orderId. Ensure your WooCommerce bridge sets merchantRef to something like WC{orderId} so you can map it back.
+Asynchronous notifications: Always return HTTP 200 quickly to SISP. Do not perform long database or network operations inside the request handler. Use asynchronous functions or ctx.waitUntil() to notify WooCommerce.
+7. Testing the Transaction Status API
+
+If you need to query the status of a transaction (for example, when the callback was lost), follow these steps.
+
+Construct the request: Use Basic authentication with your PORTAL_ID and PORTAL_PASSWORD. Build a JSON or form body with posID, posAuthCode and merchantRef. Example using curl:
+
+curl -X POST https://sisp.test.vinti4.cv/transaction-status \
+  -u "$PORTAL_ID:$PORTAL_PASSWORD" \
+  -H "Content-Type: application/json" \
+  -d '{"posID":"20314869","posAuthCode":"ttqRdOzmGvCSpuag","merchantRef":"R20240510153000"}'
+Interpret the response: A successful transaction returns a status like "success" along with clearingPeriod and transactionID. If you previously marked the session as failed, update it to success. If the status is pending, keep monitoring or mark it as pending. For not found or error statuses, log the result and raise an alert.
+Error handling: If the API returns a 401 or 403 error, check your PORTAL_ID and PORTAL_PASSWORD. If you receive a network error, verify the endpoint URL and your network connectivity.
+8. Testing tokenization (phase 2)
+
+Tokenization involves three operations: token creation (transactionCode=5), token payments (transactionCode=6) and token cancellation (transactionCode=7). These require additional fields and response handling. For early testing:
+
+Token creation: Send a /create-payment request with transactionCode: "5" and the same purchaseRequest. The callback will include a token field. Verify that you store this token securely in D1 along with its expiry date.
+Token payment: Send a new /create-payment request with transactionCode: "6", include the previously received token, and compute the fingerprint accordingly. Validate that SISP charges the card and that the callback indicates success.
+Token cancellation: Send a request with transactionCode: "7" and the token. Ensure that the token is removed from your database and that subsequent attempts to use it fail.
+
+Tokenization tests usually involve contacting SISP’s support for test tokens and specific payment scenarios. Refer to the tokenization specification (MOP023) for exact field requirements and expected responses.
+
+9. Logging and Debugging
+
+During all tests, logging is your best friend. Follow these guidelines:
+
+Verbose logs: Include the raw request body, computed fingerprints, expected and received values, and any decisions made by the Worker.
+Persistent storage: Store logs in a file or database, not just console output, so that you can review past transactions.
+Sensitive data: Do not log full card numbers; mask PAN as in the callback (e.g., ************1234). Avoid logging posAuthCode or portal passwords.
+Troubleshooting: If something fails:
+Compare the raw request and response payloads to the specification.
+Recompute the fingerprint manually with a script to see if your Worker is wrong.
+Check the Worker’s environment variables and ensure there are no typos.
+For network errors, verify endpoints and firewall settings.
+10. Summary
+
+By following this step‑by‑step guide, you will be able to:
+
+Set up the development environment for the Vinti4 Worker.
+Run unit tests to validate cryptographic functions and fingerprint logic.
+Simulate payment requests and responses locally using Postman or curl.
+Handle SISP callbacks correctly, including success and error cases.
+Test the transaction status API and lay the groundwork for tokenization.
+Log and diagnose any problems that arise during testing.
+
+Vinti4 Worker Testing Guide (Updated)
+
+This updated guide combines the original Vinti4 testing plan with the detailed instructions from a later review. It provides everything a non‑coder needs to install tools, configure the environment, write and run tests, and validate the integration with both the SISP sandbox and WordPress. It also highlights common pitfalls and best practices.
+
+Overview
+
+The Vinti4 integration uses a Cloudflare Worker as the payment layer, replacing fragile PHP plugins. To ensure the Worker behaves exactly like the reference implementation and conforms to SISP’s protocols, you should follow a staged testing process:
+
+Phase 0 – Setup: install Node.js and testing tools, configure environment files, and set up Wrangler and Vitest. Use .dev.vars to store secrets.
+Phase 1 – Unit tests: verify cryptographic primitives and fingerprint algorithms offline, without contacting SISP.
+Phase 2 – Endpoint tests: test /create-payment and /callback locally using Miniflare or Wrangler with mock data.
+Phase 3 – End‑to‑end tests: interact with SISP’s test environment using real test cards and remote Workers.
+Phase 4 – WordPress bridge: integrate and test the WooCommerce bridge.
+Phase 5 – Production smoke tests: perform pilot and low‑value transactions in production.
+Phase 0: Setup — Tools & Environment
+0.1 Prerequisites
+Requirement	Purpose	Installation
+Computer (macOS, Linux or Windows)	The development and testing platform.	N/A
+Internet connection	Required to download packages and contact SISP.	N/A
+Node.js ≥ 18	Provides a JavaScript runtime and npm. Node 20 or later is recommended because it includes a stable Web Crypto API. Node 18 also works if crypto.subtle is available.	Install using Node Version Manager (nvm) or download the LTS installer from nodejs.org.
+npm	Package manager included with Node.js. Used to install dependencies.	Installed with Node.
+Git	Optional for cloning the repository.	Install from git-scm.com or download the project as a ZIP.
+Cloudflare account (optional for local tests)	Needed if you deploy to Cloudflare or use wrangler dev --remote.	Sign up at dash.cloudflare.com.
+Wrangler CLI	Tool to run and deploy Workers.	Will be installed in the next step.
+Vitest	Test runner used for unit and integration tests.	Will be installed in the next step.
+Miniflare	Local environment that provides Web Crypto and other Worker APIs during tests.	Installed alongside Vitest.
+Postman or curl	For sending HTTP requests during manual tests.	Postman can be downloaded from postman.com. curl is available on most systems.
+Text editor	To edit configuration files.	Visual Studio Code is recommended.
+0.2 Install tools
+
+Install Node.js. After installation, verify the version:
+
+node --version
+npm --version
+
+Ensure node prints at least v18.x.x.
+
+Clone or download the Worker project:
+
+git clone https://github.com/your-org/vinti4-worker.git
+
+cd vinti4-worker
+
+If you prefer, download the repository as a ZIP and extract it.
+
+Install dependencies. Run:
+
+npm install
+
+For testing and Worker types:
+
+npm install -D vitest wrangler @cloudflare/workers-types miniflare
+
+vitest is the test runner.
+wrangler lets you run and deploy Workers.
+@cloudflare/workers-types provides type definitions for TypeScript.
+miniflare simulates Cloudflare’s runtime in Vitest.
+
+Install Wrangler globally (optional if using only local dev):
+
+npm install -g wrangler
+wrangler --version
+
+0.3 Configure environment variables
+
+For Wrangler 3, secrets are read from .dev.vars and .env files. Create .dev.vars in the project root (copy from .dev.vars.example if provided). Populate it with your SISP test credentials:
+
+POS_ID=20314869
+POS_AUTH_CODE=ttqRdOzmGvCSpuag
+SISP_URL=https://sisp.test.vinti4.cv/vbv2/vbv
+CALLBACK_SECRET=my-callback-secret
+CALLBACK_URL=https://your-worker-domain.com/callback
+PORTAL_ID=my-portal-id
+PORTAL_PASSWORD=my-portal-password
+
+Important: .dev.vars must never be committed to version control. If the file is missing, the Worker will run but all fingerprint functions will silently use undefined for posAutCode and produce invalid hashes. Always verify that environment variables load correctly.
+
+0.4 Configure Vitest and Miniflare
+
+Create or update vitest.config.ts to use Miniflare:
+
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'miniflare',
+    environmentOptions: {
+      bindings: {},
+      kvNamespaces: [],
+    },
+  },
+});
+
+This ensures that crypto.subtle and other Worker APIs are available in tests. Without this configuration, crypto.subtle.digest will be undefined and fingerprint tests will throw TypeError.
+
+0.5 Caveats
+If .dev.vars is misconfigured or missing, the Worker starts with undefined secrets. SISP will reject all payments due to incorrect fingerprints.
+Ensure that CALLBACK_URL in .dev.vars points to a publicly reachable URL when testing with SISP. For local development, use wrangler dev --remote (see Phase 3).
+Phase 1: Fingerprint Unit Tests (Offline)
+
+Before contacting SISP, ensure your cryptographic functions and fingerprint logic are correct.
+
+1.1 Test 1a — sha512Base64 raw binary output
+
+Use Vitest to test your sha512Base64 helper. The test should feed the string 123456789A to the helper and expect the Base64 output TrmzQzqPgdgicNXUMMKu8p+rtbSoqZDkXeHBZVeZdkyY/BhPZKArQpCJAP4GsPaJbviDg51P8iYlyohDjNr52w==. This value comes from SISP’s Security Protocol and ensures you are hashing to raw binary, not hex. If the output differs, do not proceed to other tests until fixed.
+
+1.2 Test 1b — send fingerprint (GerarFingerPrintEnvio)
+
+Write a test using a worked example from the Security Protocol or your PHP plugin. Verify that buildSendFingerprint concatenates fields in the order:
+
+base64(SHA-512(posAutCode))
+timestamp (format yyyy-MM-dd HH:mm:ss)
+(amount × 1000) (integer)
+merchantRef.trim()
+merchantSession.trim()
+posID.trim()
+currency.trim()
+transactionCode.trim()
+entityCode (optional, numeric; strip leading zeros)
+referenceNumber (optional, numeric; strip leading zeros)
+
+Any deviation—missing fields, not scaling the amount, or forgetting to trim—will produce the wrong result. CVE amounts must be scaled by 1000.
+
+1.3 Test 1c — response fingerprint (success)
+
+Implement buildResponseFingerprint for success cases. The correct field order is:
+
+base64(SHA-512(posAutCode))
+messageType
+clearingPeriod (CP – strip leading zeros)
+transactionID (TID – strip leading zeros)
+merchantRespMerchantRef
+merchantRespMerchantSession
+purchaseAmount × 1000 (integer)
+messageID
+pan (masked)
+merchantResp (e.g., "C")
+timestamp
+referenceNumber (optional)
+entityCode (optional)
+clientReceipt
+additionalErrorMessage
+reloadCode (keep zeros — do not strip)
+
+Write a test with the known example from the Security Protocol: the expected fingerprint should be URCdX5Y4D4YW1afIdlbdRMx+FDAt//jdvFJreGUZC98n2xepsGcAlgrWUPQj4n+lcWS04Dm9kNGY4G1N82pPeQ==. Include variations where CP and TID have leading zeros and ensure your function strips them.
+
+1.4 Test 1d — response fingerprint (error, messageType = 6)
+
+Error responses use a different field set. Use the example from the PDF where messageType=6 and verify the expected fingerprint, such as AYpWZLwKhnwXtfDAW4l15D9oM3fVtJOwZkKt89djbAZP+L2FW/hPuHeyMQQVmX16xvmoSzRptSNcM5AGy0Y93w==. The field order is:
+
+base64(SHA-512(posAutCode))
+messageType
+merchantRespMessageID
+merchantRespErrorCode
+merchantRespErrorDetail
+merchantRespErrorDescription
+merchantRespMerchantRef
+merchantRespMerchantSession
+merchantRespAdditionalErrorMessage
+merchantRespTimeStamp
+
+Test that using the success algorithm on an error callback fails, and that the error-specific algorithm passes.
+
+1.5 Running unit tests
+
+Run all tests with:
+
+npx vitest run --reporter=verbose
+
+Do not proceed to integration tests until all fingerprint tests pass. Cryptographic errors cascade into every other phase.
+
+Phase 2: Worker Endpoint Tests (Local)
+
+Once the fingerprints work offline, test the /create-payment and /callback endpoints locally using Miniflare (via Vitest) or Wrangler.
+
+2.1 Test 2a — /create-payment returns correct fields
+
+Send a valid JSON body containing orderId, amount, merchantRef, merchantSession (or let the Worker generate it), callbackUrl, and a minimal customer object. Assert that the response JSON includes:
+
+sessionId: a UUID or unique string referencing the session.
+formHtml: an HTML form tag whose action attribute equals the SISP URL and includes FingerPrint, TimeStamp, and FingerPrintVersion as query parameters. These values must also appear as hidden inputs in the form body.
+
+Ensure that none of the required fields are missing and that the worker correctly inserts the Base64‑encoded purchaseRequest.
+
+2.2 Test 2b — missing required fields returns 400
+
+For each required field, send a request missing that field and assert that the Worker returns HTTP 400 with a structured JSON error (e.g., { "error": "Missing field", "field": "amount" }). Do not return a plain string, as the WordPress bridge cannot parse it.
+
+2.3 Test 2c — purchaseRequest JSON structure
+
+Extract the purchaseRequest from the generated form, Base64‑decode it, and parse the JSON. Check that all mandatory 3DS fields are present: email, billAddrCity, billAddrCountry (numeric code), billAddrLine1, billAddrPostCode (default to "0000" if empty), acctInfo with all required sub‑fields, and phone numbers with correct country code and subscriber number. Ensure purchaseDate is not included, as it is deprecated.
+
+Also ensure the country code is numeric (e.g., CV → 132); sending "CV" as a string will cause silent 3DS failure.
+
+2.4 Test 2d — /callback with valid fingerprint
+
+Construct a mock callback body using the same values from your /create-payment test. Compute the correct success fingerprint and send the payload as application/x-www-form-urlencoded. Assert that the Worker:
+
+Returns HTTP 200.
+Updates the session in D1 to success.
+Calls the WooCommerce webhook asynchronously (mock fetch and check ctx.waitUntil was used).
+Verifies both messageType ∈ {8, 10, P, M} and merchantResp = "C", not just the fingerprint.
+2.5 Test 2e — /callback with tampered fingerprint
+
+Send the same callback but change one field (e.g., increase merchantRespPurchaseAmount or modify merchantRespTid) without updating the fingerprint. Assert that the Worker still returns HTTP 200 to SISP but marks the session as failed (reason: fingerprint_mismatch) and logs the mismatch.
+
+2.6 Test 2f — amount mismatch
+
+Create a session for 500 CVE. Send a callback where the fingerprint is valid but the merchantRespPurchaseAmount reports 600. Assert that the session is marked failed with reason amount_mismatch.
+
+2.7 Logging in endpoint tests
+
+In your local tests, check that the Worker logs include the following fields:
+
+{
+  timestamp: new Date().toISOString(),
+  sessionId: formData.get('merchantRespMerchantRef'),
+  messageType: formData.get('messageType'),
+  received: formData.get('resultFingerPrint'),
+  computed: computedFingerprint,
+  match: received === computed,
+  amount_received: formData.get('merchantRespPurchaseAmount'),
+  amount_expected: session?.amount,
+}
+
+Printing this object to console (or storing it) makes diagnosing mismatches straightforward.
+
+Phase 3: End‑to‑End Tests (SISP Sandbox)
+
+After passing all local tests, move to the SISP test environment.
+
+3.1 Obtain test credentials
+
+Contact SISP at gestao.operacoes@sisp.cv and request a test POS ID, test POS Auth Code, test VBV URL, and test card numbers. Test cards expire periodically, so refresh them if a card that worked last week no longer works. You cannot perform Phase 3 tests without these credentials.
+
+3.2 Start Wrangler in remote mode
+
+Run:
+
+wrangler dev --remote
+
+This deploys the Worker to a temporary *.workers.dev subdomain that SISP can reach. The console output will show a URL such as https://your-project.your-account.workers.dev. Use this URL as the CALLBACK_URL and urlMerchantResponse in test payments. wrangler dev --local will not receive callbacks from SISP.
+
+3.3 Test 3a — full payment flow
+Send a /create-payment request using Postman or your WooCommerce bridge.
+Copy the returned formHtml, save it as an .html file, and open it in your browser. It should auto‑submit and redirect you to SISP’s hosted payment page.
+Enter one of the SISP test card numbers and complete the authentication. SISP will POST the callback to your /callback endpoint on the workers.dev domain.
+In your terminal, watch the logs printed by wrangler dev. You should see the callback arrive and the fingerprint match succeed. If the callback does not arrive within 30 seconds, verify that the callback URL in your payment request exactly matches your workers.dev URL and that there is no typo.
+3.4 Test 3b — declined card flow
+
+SISP provides test card numbers that simulate declines. Use one and repeat Test 3a. Assert that:
+
+messageType = 6 or messageType = 10.
+merchantResp may be "D" (denied).
+The Worker applies the error fingerprint algorithm and marks the session as failed with the error fields. Do not use the success fingerprint algorithm on an error response—it will always mismatch and incorrectly report tampering.
+3.5 Test 3c — user cancellation
+
+If the user cancels on the SISP payment page, SISP sends a callback with userCancelled=true and no messageType. In this case, do not attempt fingerprint validation. Mark the session as cancelled and notify WooCommerce. Ensure your Worker handles this branch gracefully.
+
+3.6 Test 3d — transaction status API (timeout simulation)
+
+To test recovery from missing callbacks:
+
+Initiate a /create-payment request but do not complete the payment.
+After a delay (e.g., 60 seconds), call your /transaction-status?sessionId=<sessionId> endpoint.
+The Worker should call SISP’s /pos/transaction-status API using HTTP Basic auth with PORTAL_ID and PORTAL_PASSWORD, passing posID, posAuthCode, and merchantRef.
+Interpret the response: update your session accordingly or mark it pending. Ensure you log the status and handle not found responses.
+
+Note: Do not reuse POS credentials for the status API; SISP returns HTTP 401 if you do.
+
+Phase 4: WordPress Bridge Integration
+
+After validating the Worker against SISP, integrate with WooCommerce.
+
+4.1 Test 4a — WooCommerce bridge calls /create-payment
+Activate the custom Vinti4 bridge plugin on your WooCommerce staging site.
+Place a test order and proceed to checkout. The bridge should POST to your Worker with the order total as an integer (e.g., 25 CVE → 2500). The Worker should return formHtml and the bridge should embed and auto‑submit it, redirecting the user to the SISP payment page.
+Confirm in your Worker logs that the fingerprint matches and that the customer is redirected.
+4.2 Test 4b — WooCommerce receives payment result
+Complete the payment and ensure the Worker invokes the WooCommerce REST endpoint (for example /wp-json/morabeza/v1/payment-result) asynchronously. It should include the order ID, session ID, and status (success, failed, cancelled).
+The WP endpoint should validate an X-Secret header (matching CALLBACK_SECRET) and update the order status accordingly.
+Check WooCommerce admin: the order should move from pending to completed (or failed/cancelled) and include a note with the SISP transaction reference.
+4.3 Test 4c — header validation
+
+Send a POST to the WP REST endpoint without the X-Secret header or with a wrong value. It must return HTTP 403 and not update any order. This prevents malicious actors from faking callbacks. Then send a valid request to confirm the order updates.
+
+Phase 5: Production Smoke Test
+
+After all sandbox tests pass, conduct a controlled production rollout.
+
+5.1 Pilot transaction with SISP
+
+SISP requires at least one pilot transaction before enabling international Visa/Mastercard processing. Contact them to schedule the pilot. This test ensures that your site sends correct 3DS fields and verifies the callback fingerprint on your side.
+
+5.2 Real low‑value transaction
+
+Conduct a real purchase for the lowest allowed amount (e.g., 1 CVE). Use a real card and verify that the transaction completes end‑to‑end: WooCommerce marks the order completed, D1 records the session as successful, and logs show the callback was processed without errors.
+
+5.3 Monitor for 48 hours
+
+After going live, monitor logs (via wrangler tail or Logpush) and D1 for at least 48 hours. Look for:
+
+Any fingerprint_mismatch entries (should be zero). Investigate immediately.
+Sessions stuck in pending status – indicates missing callbacks; verify network and test the transaction status API.
+Unusual error codes from SISP or repeated declines with the same card numbers.
+Additional Guidelines and Common Errors
+Raw vs hex hashing: Always use raw binary output from SHA‑512 before Base64 encoding. Never Base64‑encode the hex string.
+Amount scaling: Multiply the amount by 1000 inside fingerprint functions only; send the unscaled integer in the form fields.
+Field trimming and zero stripping: Strip leading zeros from clearingPeriod, transactionID, entityCode, and referenceNumber when computing the response fingerprint. Do not strip zeros from reloadCode.
+Idempotency: Always return HTTP 200 to SISP, even on errors. Do not update order status twice – check if the session is already processed and ignore duplicate callbacks.
+Asynchronous updates: Use ctx.waitUntil() to send notifications to WooCommerce so that SISP’s callback is acknowledged quickly.
+Language codes: Use languageMessages values "pt" or "en" for Portuguese and English respectively. Unsupported values cause SISP to default to Portuguese.
+Environment separation: Use different credentials and URLs for development, staging, and production. Do not mix test and live POS IDs.
+Logging Patterns
+
+Consistent logging makes debugging easier. At minimum, log an object containing:
+
+{
+  timestamp: new Date().toISOString(),
+  sessionId: merchantRef,
+  messageType: formData.get('messageType'),
+  receivedFingerPrint: formData.get('resultFingerPrint'),
+  computedFingerPrint: computedFingerprint,
+  match: receivedFingerPrint === computedFingerprint,
+  amountReceived: Number(formData.get('merchantRespPurchaseAmount')),
+  amountExpected: session.amount,
+  merchantResp: formData.get('merchantResp'),
+  merchantRef: formData.get('merchantRespMerchantRef'),
+  merchantSession: formData.get('merchantRespMerchantSession'),
+}
+
+Printing this log to the console in development or storing it in D1 or Logpush in production allows quick comparison of expected vs received values. Do not log full PAN or auth codes; mask sensitive data.
+
+Conclusion
+
+By following this comprehensive guide you will:
+
+Install and configure all necessary tools (Node.js, Vitest, Wrangler, Miniflare) and environment variables.
+Validate cryptographic functions and fingerprint algorithms through unit tests before contacting SISP.
+Test your Worker’s /create-payment and /callback endpoints locally, handling success, failure, cancellation, missing fields, and amount mismatches correctly.
+Perform realistic end‑to‑end tests against SISP’s sandbox, including declined cards, user cancellation, and transaction status queries.
+Verify the WordPress bridge integration and secure it with an X-Secret header.
+Conduct a pilot and live smoke tests in production, then monitor logs to catch any anomalies.
+
+This guide integrates best practices from multiple sources and ensures you have all the details necessary to build a robust and secure payment solution with Vinti4.
+
+Once all tests pass locally, you can confidently deploy the Worker to Cloudflare and repeat the tests in the SISP sandbox. Keep your credentials and environment variables separate for development, staging and production to avoid accidental use of real credentials in test environments.

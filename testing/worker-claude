@@ -1,0 +1,681 @@
+use this data to update , research each item in yoru sources and let me know if its all valid  : 
+think deeply 
+Here's my honest assessment:
+
+PRD Evaluation Against SISP Documentation
+What the PRD gets right
+The architecture decision is solid. Moving all fingerprint logic out of WordPress and into a Cloudflare Worker is exactly the right call. The original plugin is fragile because PHP handles the cryptography in the request path, and any misconfiguration or WP update can silently break it. The Worker is stateless, testable in isolation, and doesn't rot.
+The D1 session table design is sensible. Storing merchant_ref, amount, status and timestamps independently of WooCommerce gives you a source of truth that survives a WordPress crash or botched plugin update.
+The Sprint structure is realistic for your stack.
+
+Critical gaps and corrections
+1. Fingerprint calculation is wrong in the skeleton
+This is the biggest problem. The skeleton's computeFingerprint is a placeholder that does not match what SISP actually requires.
+Per the Security Protocol doc (v2.0), the send fingerprint must concatenate fields in this exact order - no separator:
+base64(sha512(posAutCode))
++ timestamp (yyyy-MM-dd HH:mm:ss)
++ (amount * 1000, integer part only)
++ merchantRef.trim()
++ merchantSession.trim()
++ posID.trim()
++ currency.trim()
++ transactionCode.trim()
+[+ Number(entityCode) if used]
+[+ Number(referenceNumber) if used]
+Then the whole string is hashed again with SHA-512 and base64-encoded. The PRD skeleton skips merchantSession, posID, currency, transactionCode entirely. Any implementation based on that skeleton will fail against SISP's endpoint every time.
+The response fingerprint for success (messageType 8, 10, P, M) requires a different field order:
+base64(sha512(posAutCode))
++ messageType
++ merchantRespCP (strip leading zeros)
++ merchantRespTid (strip leading zeros)
++ merchantRespMerchantRef.trim()
++ merchantRespMerchantSession.trim()
++ (merchantRespPurchaseAmount * 1000, integer part)
++ merchantRespMessageID.trim()
++ merchantRespPan.trim()
++ merchantResp.trim()
++ merchantRespTimeStamp (yyyy-MM-dd HH:mm:ss)
+[+ merchantRespEntityCode (no leading zeros) if used]
+[+ merchantRespReferenceNumber (no leading zeros) if used]
++ merchantRespClientReceipt.trim()
++ merchantRespAdditionalErrorMessage.trim()
++ merchantRespReloadCode (keep zeros, e.g. "000000000000")
+For error responses (messageType 6), the field list is shorter and different again. The PRD does not distinguish these two cases at all.
+Your Worker needs two separate fingerprint functions, not one.
+2. The purchaseRequest field is mandatory for 3DSServer and is missing
+Per MOP021 v13, all purchases going through the EMV 3DS 2.2 path must include a purchaseRequest field, which is the Base64 encoding of a JSON object containing the 3DS customer data:
+json{
+  "acctID": "...",
+  "acctInfo": { "chAccAgeInd": "05", ... },
+  "email": "customer@email.com",
+  "billAddrCity": "...",
+  "billAddrCountry": "620",
+  "billAddrLine1": "...",
+  "billAddrPostCode": "0000",
+  ...
+}
+The PRD and skeleton do not mention this field at all. Without it, international Visa/Mastercard transactions will fail. The FAQ doc (MD044) confirms all web merchants must include it. For Cape Verde customers without a postal code, you send "0000" as default. For suspiciousAccActivity, always send "01" (not suspicious). For chAccAgeInd, derive it from the WooCommerce customer account creation date.
+The Worker's /create-payment endpoint needs to accept and pass through this customer data from WooCommerce, or build sensible defaults.
+3. The callback form data fields don't match the spec
+The PRD's /callback handler reads fields like posID, acquirerID, orderID, reference, amount. But what SISP actually POSTs back (from MOP021 section 2.2.2) is:
+
+merchantRespMerchantRef
+merchantRespMerchantSession
+merchantRespTid
+merchantRespCP
+merchantRespPurchaseAmount
+merchantRespMessageID
+merchantRespPan
+merchantResp
+messageType
+resultFingerPrint
+resultFingerPrintVersion
+
+There is no orderID field in the callback. The Worker needs to match merchantRespMerchantRef back to the stored session, not orderID. Since merchantRef = WC{orderId}, that mapping works - but the code needs to read the right field names.
+Also: success is not just resultFingerPrint matching. You also need messageType == "8" AND merchantResp == "C" for a purchase. The PRD only checks the fingerprint.
+4. The transaction status API has a different auth pattern
+Per the API doc you uploaded, the transaction-status endpoint uses HTTP Basic auth (base64 of portalId:password), not the POS auth code pattern used for payments. The Worker will need separate credentials for this endpoint - PORTAL_ID and PORTAL_PASSWORD as additional secrets, distinct from POS_ID and POS_AUTH_CODE.
+The request body also requires posID, posAuthCode, and merchantRef - not a sessionId. The PRD's /transaction-status?sessionId=... endpoint would need to look up the merchantRef from D1 first, then call SISP with the correct fields.
+5. Amount handling: CVE does not have decimal places
+The PRD says "integer CVE" which is correct - but the fingerprint spec says multiply by 1000 before hashing, even though CVE has no decimals in practice. So 500 CVE becomes 500000 in the hash. The WooCommerce bridge needs to send integer CVE to the Worker (2500 not 25.00), and the Worker multiplies by 1000 internally for the fingerprint only. The SISP page gets the original integer. This needs to be explicit in the spec.
+6. Token payments use transactionCode=6, not standard 1
+The tokenization docs (MOP023) show that token-based purchases use transactionCode=6, not transactionCode=1. The PRD doesn't flag this distinction. If the Worker sends transactionCode=1 on a token payment, SISP will reject it.
+
+Structural recommendations
+The Worker's /callback endpoint is currently trying to do too much synchronously - validate fingerprint, update D1, AND notify WordPress in the same request. If the WordPress wp-json endpoint is slow or down, SISP's POST times out and may retry, causing duplicate processing. Use ctx.waitUntil() for the WordPress notification so SISP gets its 200 immediately.
+typescript// Return 200 to SISP first, notify WP async
+ctx.waitUntil(notifyWordPress(env, orderData));
+return new Response('OK', { status: 200 });
+The callbackUrl should not come from the WooCommerce request body in production - it should be hardcoded or derived from the Worker's env. Otherwise a malicious request could redirect payment confirmations anywhere.
+
+Summary verdict
+The PRD's architecture, data model, and sprint plan are all valid. The Worker-as-payment-layer approach is the right call. But the implementation spec has three issues that would cause immediate failures against SISP in production: the fingerprint function is incomplete, the purchaseRequest 3DS field is missing, and the callback field names are wrong. Fix those three and you have a solid foundation to build on.<?php
+
+// REMOVE CHACHE
+header("Expires: Tue, 01 Jan 2000 00:00:00 GMT");
+header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT");
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cachepastedcallback file from plugin :
+<?php
+require_once("../../../../wp-load.php");
+include 'lib.php';
+//$preffix = "/wordpress";
+$preffix = "../../../../";
+$posAutCode = get_option('pos_auth_code');
+$error = "";
+$errorDetail = "";
+$errorAditional = "";
+$successMessageType = array('8', '10', 'P', 'M');
+if(isset($_POST["messageType"]) && in_array($_POST["messageType"], $successMessageType))
+{
+    // FAZER VALIDAÇÕES DE FINGERPRINT
+    $fingerPrintCalculado = GerarFingerPrintRespostaBemSucedida(
+        $posAutCode , $_POST["messageType"] , $_POST["merchantRespCP"] ,
+        $_POST["merchantRespTid"] , $_POST["merchantRespMerchantRef"] , $_POST["merchantRespMerchantSession"] ,
+        $_POST["merchantRespPurchaseAmount"] , $_POST["merchantRespMessageID"] , $_POST["merchantRespPan"] ,
+        $_POST["merchantResp"] , $_POST["merchantRespTimeStamp"] , $_POST["merchantRespReferenceNumber"] ,
+        $_POST["merchantRespEntityCode"] , $_POST["merchantRespClientReceipt"] , trim($_POST["merchantRespAdditionalErrorMessage"]) ,
+        $_POST["merchantRespReloadCode"]
+    );    if($_POST["resultFingerPrint"] == $fingerPrintCalculado)
+    {
+        // ENCERRAR O CARRINHO DE COMPRAS
+        global $woocommerce;
+        $order = new WC_Order($_POST['merchantRespMerchantRef']);
+        if($_POST['merchantRespPurchaseAmount'] == $order->get_total())
+        {
+            // Mark as completed
+            $order->update_status('completed', __( 'Awaiting cheque payment', 'woocommerce' ));
+            // Reduce stock levels
+            $order->reduce_order_stock();
+            // Remove cart
+            $woocommerce->cart->empty_cart();
+            // REDIRECIONAR PARA PAGINA DE SUCESSO
+            header("Location: " . $order->get_checkout_order_received_url());
+        }
+        else
+        {
+            header("Location: " . $preffix . "checkout-sem-sucesso?error=amount");
+        }
+    }
+    else
+    {
+        header("Location: " . $preffix . "checkout-sem-sucesso?error=fgpt");
+    }}
+else
+{
+    if(isset($_POST["messageType"]))
+    {
+        //header("Location: $preffix/checkout-sem-sucesso?error=" . $_POST["merchantRespErrorDetail"] . "&detail=" . $_POST["merchantRespErrorDescription"]);
+        $error = $_POST["merchantRespErrorDetail"];
+        $errorDetail = $_POST["merchantRespErrorDescription"];
+        $errorAditional = $_POST["merchantRespAdditionalErrorMessage"];
+    }
+    elseif(isset($_GET["messageType"]))
+    {
+        //header("Location: $preffix/checkout-sem-sucesso?error=" . $_GET["merchantRespErrorDetail"] . "&detail=" . $_GET["merchantRespErrorDescription"]);
+        $error = $_GET["merchantRespErrorDetail"];
+        $errorDetail = $_GET["merchantRespErrorDescription"];
+        $errorAditional = $_GET["merchantRespAdditionalErrorMessage"];
+    }
+    else
+    {
+        $error = "Erro na realização de Pagamento";
+        $errorDetail = "Ocorreu algo inesperado.";
+        //header("Location: $preffix/checkout-sem-sucesso?error=mt");
+    }
+}
+?>
+<?php /* Template Name: CustomPageT1 */ ?><?php get_header(); ?><div id="primary" class="content-area">
+    <main id="main" class="site-main" role="main">
+       <h3><?php echo $errorAditional; ?></h3>
+       <p><?php echo $error; ?></p>
+       <p><?php echo $errorDetail; ?></p>       <a href='<?php echo wc_get_checkout_url();?>'>Tentar Novamente</a>    </main> </div><?php get_footer(); ?>lib.php file: 
+<?php
+function GerarFingerPrintEnvio
+    (
+        $posAutCode, $timestamp, $amount,
+        $merchantRef, $merchantSession, $posID,
+        $currency, $transactionCode, $entityCode,
+        $referenceNumber
+    )
+{
+    $toHash = base64_encode(hash('sha512', $posAutCode, true)) . $timestamp . ((int)((float)$amount * 1000))
+            . $merchantRef . $merchantSession . $posID
+            . $currency . $transactionCode . $entityCode . $referenceNumber
+        ;
+    return base64_encode(hash('sha512', $toHash, true));
+}
+function GerarFingerPrintRespostaBemSucedida
+    (
+        $posAutCode, $messageType, $clearingPeriod,
+        $transactionID, $merchantReference, $merchantSession,
+        $amount, $messageID, $pan,
+        $merchantResponse, $timestamp, $reference,
+        $entity, $clientReceipt, $additionalErrorMessage,
+        $reloadCode
+    )
+{
+    // EFETUAR O CALCULO CONFORME A DOCUMENTAÇÃO
+    $toHash = base64_encode(hash('sha512', $posAutCode, true)) . $messageType . $clearingPeriod . $transactionID
+            . $merchantReference . $merchantSession .
+            ((int)((float)$amount * 1000)) . $messageID . $pan .
+            $merchantResponse . $timestamp . $reference .
+            $entity . $clientReceipt . $additionalErrorMessage .
+            $reloadCode
+        ;
+    return base64_encode(hash('sha512', $toHash, true));
+}
+function endsWith($haystack, $needle)
+{
+    $length = strlen($needle);
+    if(!$length)
+    {
+        return true;
+    }
+    return substr($haystack, -$length) === $needle;
+}
+?>
+postback php fuile :do these helpShow more11:26 PMYes, these files are gold. Now I have the actual production implementation to compare against. Let me give you the full picture.
+
+What the real code reveals
+The fingerprint functions (lib.php) - now fully documented
+Here's the exact TypeScript translation of what the plugin actually does:
+typescriptimport { createHash } from 'crypto'; // Node-compatible; use Web Crypto in Workers
+
+function sha512Raw(input: string): Buffer {
+  return createHash('sha512').update(input, 'utf8').digest();
+}
+
+function base64(buf: Buffer): string {
+  return buf.toString('base64');
+}
+
+// ---- SEND fingerprint (postback.php -> SISP) ----
+export function buildSendFingerprint(
+  posAutCode: string,
+  timestamp: string,         // 'yyyy-MM-dd HH:mm:ss'
+  amount: number,            // integer CVE - e.g. 500
+  merchantRef: string,
+  merchantSession: string,
+  posID: string,
+  currency: string,          // always '132'
+  transactionCode: string,   // '1' for purchase
+  entityCode: string,        // '' for purchases
+  referenceNumber: string    // '' for purchases
+): string {
+  const hashedAutCode = base64(sha512Raw(posAutCode));
+  const amountScaled = Math.trunc(amount * 1000); // 500 CVE -> 500000
+
+  const toHash =
+    hashedAutCode +
+    timestamp +
+    amountScaled +
+    merchantRef +
+    merchantSession +
+    posID +
+    currency +
+    transactionCode +
+    entityCode +       // only appended when non-empty
+    referenceNumber;   // only appended when non-empty
+
+  return base64(sha512Raw(toHash));
+}
+
+// ---- RESPONSE fingerprint (callback.php <- SISP) ----
+export function buildResponseFingerprint(
+  posAutCode: string,
+  messageType: string,
+  clearingPeriod: string,    // strip leading zeros before concat
+  transactionID: string,     // strip leading zeros
+  merchantReference: string,
+  merchantSession: string,
+  amount: string,            // raw string as received, e.g. '1000.00'
+  messageID: string,
+  pan: string,               // '************1234'
+  merchantResponse: string,  // 'C' on success
+  timestamp: string,
+  reference: string,
+  entity: string,
+  clientReceipt: string,
+  additionalErrorMessage: string,
+  reloadCode: string
+): string {
+  const hashedAutCode = base64(sha512Raw(posAutCode));
+  const amountScaled = Math.trunc(parseFloat(amount) * 1000);
+
+  const toHash =
+    hashedAutCode +
+    messageType +
+    clearingPeriod +
+    transactionID +
+    merchantReference +
+    merchantSession +
+    amountScaled +
+    messageID +
+    pan +
+    merchantResponse +
+    timestamp +
+    reference +
+    entity +
+    clientReceipt +
+    additionalErrorMessage +
+    reloadCode;
+
+  return base64(sha512Raw(toHash));
+}
+The critical detail the PRD skeleton missed: hash('sha512', $input, true) uses the raw binary output, then base64-encodes that. If you hash to hex first and then base64 it, you get a completely different result. Every fingerprint fails silently and looks like a tampering attempt.
+In Web Crypto (Cloudflare Workers environment):
+typescriptasync function sha512Base64(input: string): Promise<string> {
+  const encoded = new TextEncoder().encode(input);
+  const hashBuf = await crypto.subtle.digest('SHA-512', encoded);
+  // base64 encode the raw binary buffer
+  return btoa(String.fromCharCode(...new Uint8Array(hashBuf)));
+}
+
+export async function buildSendFingerprint(
+  posAutCode: string,
+  timestamp: string,
+  amount: number,
+  merchantRef: string,
+  merchantSession: string,
+  posID: string,
+  currency: string,
+  transactionCode: string,
+  entityCode = '',
+  referenceNumber = ''
+): Promise<string> {
+  const hashedAutCode = await sha512Base64(posAutCode);
+  const amountScaled = Math.trunc(amount * 1000);
+
+  const toHash =
+    hashedAutCode +
+    timestamp +
+    String(amountScaled) +
+    merchantRef.trim() +
+    merchantSession.trim() +
+    posID.trim() +
+    currency.trim() +
+    transactionCode.trim() +
+    (entityCode ? String(Number(entityCode)) : '') +
+    (referenceNumber ? String(Number(referenceNumber)) : '');
+
+  return sha512Base64(toHash);
+}
+
+postback.php - the URL construction is unusual
+The plugin appends FingerPrint, TimeStamp, and FingerPrintVersion as query parameters while posting everything else as form fields:
+php$postUrl .= "?FingerPrint=" . urlencode($fields["fingerprint"])
+          . "&TimeStamp=" . urlencode($fields["timeStamp"])
+          . "&FingerPrintVersion=" . urlencode($fields["fingerprintversion"]);
+But the form body still contains timeStamp and fingerprintversion as hidden inputs. So SISP receives FingerPrint in the URL and fingerprint (lowercase) in the body simultaneously. Your Worker needs to replicate this exact pattern - don't clean it up without confirming with SISP that the new endpoint accepts a cleaner request.
+Also notice: the plugin sends purchaseDate inside purchaseRequest JSON. The SISP spec v12 changelog explicitly says purchaseDate was removed from the JSON and that TimeStamp is used instead - but the plugin still sends it. It probably doesn't break anything because SISP likely ignores unknown fields, but don't carry this forward in the Worker.
+callback.php - the amount comparison bug
+phpif($_POST['merchantRespPurchaseAmount'] == $order->get_total())
+This is a loose PHP comparison between a string from the POST body and WooCommerce's get_total() which returns a float. '1000.00' == 1000 is true in PHP but '1000' == 1000.0 is also true. It works by accident. In TypeScript, use strict equality after normalizing both to integers:
+typescriptconst receivedAmount = Math.round(parseFloat(formData.get('merchantRespPurchaseAmount') as string));
+const expectedAmount = session.amount; // integer CVE stored at session creation
+if (receivedAmount !== expectedAmount) {
+  // amount mismatch - reject
+}
+postback.php - the purchaseRequest field reveals another issue
+The plugin uses '04' for chAccAgeInd hardcoded (30-60 days account age) for every customer, including guests. The SISP FAQ says '01' (no account) is technically valid but not recommended by SISP. For your Worker, derive this from the WooCommerce customer's user_registered date if they're logged in, and send '02' for guest checkouts (created during transaction).
+The phone cc is hardcoded as "1" (USA country code) for all customers including Cape Verde customers who should use "238". Fix this in the Worker by deriving it from billAddrCountry.
+
+What this means for the DashWoo build
+Since DashWoo is your EmDash CMS plugin using Cloudflare Workers + D1 (not WordPress), the Worker layer in the PRD maps even more cleanly onto your stack. The fingerprint logic lives in the Worker either way. But you now have the exact PHP implementation to port from - no guessing.
+The three things to build first, in order:
+
+The two fingerprint functions in TypeScript with Web Crypto (raw binary SHA-512, then base64 - not hex). Write unit tests against known inputs from the Security Protocol PDF's worked examples before touching SISP's test environment.
+The form POST builder that replicates the URL + body split the plugin uses (FingerPrint/TimeStamp/FingerPrintVersion in query string, everything else in the form body).
+The callback handler that reads merchantRespMerchantRef (not orderID), validates both the fingerprint AND the messageType/merchantResp combination, AND checks the amount.
+
+Get those three right and the rest is plumbing.<?php
+
+/*
+ * This file is part of Composer.
+ *
+ * (c) Nils Adermann <naderman@naderman.de>
+ *     Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Composer\pasted{
+    "packages": [
+        {
+            "name": "sokil/php-isocodes",
+            "version": "4.1.0",
+            "version_normalized": "4.1.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/sokil/php-isocodes.git",
+                "repasted<?php
+// platform_check.php @generated by Composer
+$issues = array();
+if (!(PHP_VERSION_ID >= 70100)) {
+    $issues[] = 'Your Composer dependencies require a PHP version ">= 7.1.0". You are running ' . PHP_VERSION . '.';
+}
+if ($issues) {
+    if (!headers_sent()) {
+        header('HTTP/1.1 500 Internal Server Error');
+    }
+    if (!ini_get('display_errors')) {
+        if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
+            fwrite(STDERR, 'Composer detected issues in your platform:' . PHP_EOL.PHP_EOL . implode(PHP_EOL, $issues) . PHP_EOL.PHP_EOL);
+        } elseif (!headers_sent()) {
+            echo 'Composer detected issues in your platform:' . PHP_EOL.PHP_EOL . str_replace('You are running '.PHP_VERSION.'.', '', implode(PHP_EOL, $issues)) . PHP_EOL.PHP_EOL;
+        }
+    }
+    trigger_error(
+        'Composer detected issues in your platform: ' . implode(' ', $issues),
+        E_USER_ERROR
+    );
+}Show more11:29 PMThese files confirm the full dependency picture. Here's what matters for your Worker build.
+
+What these files tell us
+The ISO codes dependency is a problem you need to solve differently.
+The plugin uses sokil/php-isocodes to convert a WooCommerce billing country alpha-2 code (e.g. "CV") to its ISO 3166-1 numeric code ("132" for Cape Verde). In a Worker, you have no Composer. You need to solve this in one of two ways:
+Option A - Hardcode the common cases, fall back to a lookup table. For a Cape Verde merchant, 95%+ of transactions will be CV -> 132. Build a small hardcoded map for the countries your customers actually come from:
+typescriptconst ISO_NUMERIC: Record<string, string> = {
+  CV: '132',  // Cape Verde
+  PT: '620',  // Portugal
+  US: '840',
+  GB: '826',
+  FR: '250',
+  DE: '276',
+  NL: '528',
+  BE: '056',
+  BR: '076',
+  AO: '024',  // Angola
+  MZ: '508',  // Mozambique
+  // add others as needed
+};
+
+function getNumericCountryCode(alpha2: string): string {
+  return ISO_NUMERIC[alpha2.toUpperCase()] ?? '620'; // default to Portugal if unknown
+}
+Option B - Bundle a full ISO lookup JSON. The sokil/php-isocodes-db-only package is just JSON data. You can grab the countries.json from that package and bundle it with your Worker as a static import. Workers support JSON imports natively.
+Option A is what I'd do for MVP. The country coverage you need for Cape Verde tourism/e-commerce is maybe 20 countries.
+
+The state/subdivision lookup is worse. The plugin reads a local iso_3166-2.json file and loops through it matching state names. That loop is fragile (it matches on name not code) and slow. For your Worker, don't replicate this pattern.
+The SISP FAQ says billAddrState is Optional (not Obligatory). For Cape Verde addresses, the value should be the ISO 3166-2 subdivision code minus the country prefix - so "Praia" = "PR", "Mindelo/São Vicente" = "SV". Build a small CV-specific map, and for non-CV addresses where you don't know the subdivision code, send an empty string or omit the field entirely. It won't break the transaction.
+typescript// Cape Verde municipalities - ISO 3166-2:CV
+const CV_STATES: Record<string, string> = {
+  'São Vicente': 'SV',
+  'Mindelo': 'SV',
+  'Praia': 'PR',
+  'Santiago': 'S',
+  'Sal': 'SL',
+  'Boa Vista': 'BV',
+  'Santo Antão': 'SA',
+  'São Nicolau': 'SN',
+  'Fogo': 'FO',
+  'Brava': 'BR',
+  'Maio': 'MA',
+};
+
+The complete data flow for the Worker's /create-payment
+Now that you have the full picture, here's exactly what data needs to flow from WooCommerce to the Worker and what the Worker does with each piece:
+typescript// What WordPress sends to POST /create-payment
+interface CreatePaymentRequest {
+  orderId: string;           // WC order ID -> becomes merchantRef
+  amount: number;            // integer CVE from WC order total
+  customer: {
+    email: string;
+    phone: string;
+    billingAddress1: string;
+    billingAddress2?: string;
+    billingCity: string;
+    billingCountryAlpha2: string;  // 'CV', 'PT', etc. - Worker converts to numeric
+    billingPostcode: string;       // '' or '0000' if absent
+    billingState?: string;         // free-text name - Worker converts to code
+    shippingCity?: string;
+    shippingAddress1?: string;
+    shippingPostcode?: string;
+    shippingCountryAlpha2?: string;
+    shippingState?: string;
+  };
+  accountAge?: 'no_account' | 'new' | 'lt30' | '30_to_60' | 'gt60';
+  locale?: 'pt' | 'en';
+}
+WordPress should NOT send pre-computed numeric country codes or state codes. That lookup lives in the Worker. Keep the WP bridge dumb.
+
+The purchaseDate field
+One more thing from postback.php worth noting. The plugin sends purchaseDate inside the purchaseRequest JSON using date('YmdHsm') - that format is YmdHsm (Year, month, day, Hour, seconds, minutes) which is almost certainly a bug - it should be YmdHis (Year, month, day, Hour, minutes, seconds). The SISP spec v12 removed purchaseDate from the JSON entirely anyway. Don't include it in the Worker.
+
+Practical next step
+You have everything to write the fingerprint unit tests now. Before writing any Worker routing code, write these two tests using known values from the Security Protocol PDF:
+typescript// test/fingerprint.test.ts
+import { buildSendFingerprint, buildResponseFingerprint } from '../src/fingerprint';
+
+// Values from the Security Protocol doc worked example
+test('response fingerprint matches SISP example', async () => {
+  const result = await buildResponseFingerprint(
+    'ttqRdOzmGvCSpuag',  // posAutCode
+    '8',                  // messageType
+    '987',               // clearingPeriod
+    '26',                // transactionID
+    'R20200517133227',   // merchantRef
+    'S20200517133227',   // merchantSession
+    '1000.00',           // amount
+    'J38HvwHPPn22P1se0OxJ', // messageID
+    '************3335',  // pan
+    'C',                 // merchantResponse
+    '2020-05-17 13:30:48', // timestamp
+    '',                  // reference
+    '',                  // entity
+    '',                  // clientReceipt
+    '',                  // additionalErrorMessage
+    ''                   // reloadCode
+  );
+
+  expect(result).toBe(
+    'URCdX5Y4D4YW1afIdlbdRMx+FDAt//jdvFJreGUZC98n2xepsGcAlgrWUPQj4n+lcWS04Dm9kNGY4G1N82pPeQ=='
+  );
+});
+The Security Protocol PDF has the full worked example with the expected output. That test passing means your crypto implementation is correct. Everything else - routing, D1, WP callbacks - is just regular Worker code you've built before. Get the hash right first.Okay, make a full testing document of what I have to test first, how I have to test it, what tool I have to use to test it. Explain it step by step in detail , caveats, possible errors , things to pay attention to , and make sure the test has some sor of error log or that i at least know what went wrong if it doesnt work9:58 AMLet me read the frontend design skill first since this will be a rich testing document.
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetHere's the full testing sequence. A few things to read before you click into anything:
+The order matters. Do not touch SISP's test environment until Phase 1 passes completely. Every hour you spend debugging a SISP rejection could just be a wrong raw-binary-vs-hex decision in your SHA-512 implementation. Kill that uncertainty first with the offline unit tests.
+The one test that tells you everything is Test 1a. Feed "123456789A" into your sha512Base64 function. If you get TrmzQzqPgdgicNXUMMKu8p+rtbSoqZDkXeHBZVeZdkyY/BhPZKArQpCJAP4GsPaJbviDg51P8iYlyohDjNr52w==, your crypto is right and everything downstream is buildable. If you get anything else, fix it before writing another line.
+For logging, add this pattern to every callback handler so you always know what went wrong:
+typescriptconst log = {
+  timestamp: new Date().toISOString(),
+  sessionId: formData.get('merchantRespMerchantRef'),
+  messageType: formData.get('messageType'),
+  received: formData.get('resultFingerPrint'),
+  computed: computedFingerprint,
+  match: received === computed,
+  amount_received: formData.get('merchantRespPurchaseAmount'),
+  amount_expected: session?.amount,
+};
+console.log(JSON.stringify(log));
+
+
+Vinti4 Worker — test plan
+0
+Setup — tools & environment
+▼
+Install tools
+Node 20+Wrangler 3Vitest
+Run npm install -D vitest wrangler @cloudflare/workers-types in your worker directory. Confirm node -v is ≥ 20 — the Web Crypto API used for SHA-512 requires it.
+Create .dev.vars
+Copy .dev.vars.example and fill with SISP test credentials. This file must never be committed. Values needed: POS_ID, POS_AUTH_CODE, SISP_URL, CALLBACK_SECRET. Wrangler reads this automatically on wrangler dev.
+Caveat If .dev.vars is missing, the Worker boots but all fingerprint calls silently use undefined as the auth code — every hash will be wrong and you'll get SISP rejections with no obvious error message.
+Add vitest.config.ts
+environment: 'miniflare' gives you Web Crypto, TextEncoder, and crypto.subtle in tests without a real browser. Without this, crypto.subtle.digest is undefined and every fingerprint test throws TypeError: Cannot read properties of undefined.
+
+Phase 1 — fingerprint unit tests (offline, no SISP needed)
+▼
+Test 1a — sha512Base64 raw binary output
+Vitest This is the single most important test. The SISP spec uses raw binary SHA-512 then base64 — not hex. If your implementation hashes to hex first, every downstream fingerprint is wrong.
+
+Known input: "123456789A" → expected output: TrmzQzqPgdgicNXUMMKu8p+rtbSoqZDkXeHBZVeZdkyY/BhPZKArQpCJAP4GsPaJbviDg51P8iYlyohDjNr52w==
+
+This value is printed verbatim in the Security Protocol PDF. If your function returns anything else, stop — the crypto is wrong before touching anything else.
+
+Error to watch Getting a different base64 string that is 88 chars long but clearly different = you hashed to hex string then base64-encoded the hex. Use crypto.subtle.digest('SHA-512', encoded) and pass the raw ArrayBuffer to btoa, not the hex string.
+Test 1b — send fingerprint (full field chain)
+Vitest Use the worked example from the Security Protocol PDF section 2.4.1 with posAutCode="ttqRdOzmGvCSpuag". Verify your buildSendFingerprint produces the exact string shown.
+
+Field order to verify: base64(sha512(posAutCode)) + timestamp + (amount×1000) + merchantRef.trim() + merchantSession.trim() + posID.trim() + currency.trim() + transactionCode.trim() then base64(sha512(concat)).
+
+Caveat — amount scaling 500 CVE → 500000 not 500. CVE has no decimal places but the spec still multiplies by 1000. If you pass the integer 500 directly, the fingerprint is wrong. Use Math.trunc(amount * 1000).
+
+Caveat — entityCode/referenceNumber These fields are only appended to the hash string when non-empty AND their leading zeros must be stripped: Number("00100") → 100. Test with and without them.
+Test 1c — response fingerprint (success)
+Vitest The PDF gives a full worked example for messageType=8. Expected result: URCdX5Y4D4YW1afIdlbdRMx+FDAt//jdvFJreGUZC98n2xepsGcAlgrWUPQj4n+lcWS04Dm9kNGY4G1N82pPeQ==
+
+Caveat — clearingPeriod and transactionID The spec says strip leading zeros: "0000100" → "100". The PHP lib.php does NOT strip them explicitly — it passes raw values from $_POST. In the worked example SISP already sends "987" and "26" without leading zeros. Your Worker must handle both cases, stripping if needed.
+
+Caveat — reloadCode This field keeps its zeros: "000000000000" stays as is. The PDF explicitly says do not strip this one. Test with empty string, zeros string, and a real code.
+Test 1d — response fingerprint (error, messageType=6)
+Vitest Error responses use a completely different field set. The PDF gives a worked example with messageType=6 and posAutCode="ttqRdOzmGvCSpuag". Expected: AYpWZLwKhnwXtfDAW4l15D9oM3fVtJOwZkKt89djbAZP+L2FW/hPuHeyMQQVmX16xvmoSzRptSNcM5AGy0Y93w==
+
+Field order for error: base64(sha512(posAutCode)) + messageType + merchantRespMessageID + merchantRespErrorCode + merchantRespErrorDetail + merchantRespErrorDescription + merchantRespMerchantRef + merchantRespMerchantSession + merchantRespAdditionalErrorMessage + merchantRespTimeStamp
+
+Common mistake Using the success field order for error responses. They share only the first field (hashed posAutCode). Everything else is different.
+Run and confirm
+npx vitest run --reporter=verbose
+
+All four tests must pass before moving to Phase 2. Do not proceed if any fingerprint test fails — everything downstream depends on this being correct.
+
+Test 2a — POST /create-payment returns correct fields
+Vitest + Miniflare Send a valid JSON body with orderId, amount, merchantRef, callbackUrl, and minimal customer object. Assert the response contains: sessionId (UUID format), formHtml (contains a form tag with action pointing to SISP URL), and that fingerprint and TimeStamp appear in the URL query string — NOT only in the form body.
+
+Caveat The original plugin appends FingerPrint, TimeStamp, FingerPrintVersion as query params on the action URL while also including them as hidden form fields. Replicate this exactly. Do not clean it up without confirming with SISP.
+Test 2b — missing required fields returns 400
+Vitest + Miniflare Send requests missing each required field one at a time: no orderId, no amount, no merchantRef, no callbackUrl. Each must return HTTP 400 with a JSON body containing error and field keys so the WordPress bridge knows which field is missing.
+
+Caveat Do not return a plain string — WP's wp_remote_post will still get a 400 but won't be able to parse which field caused it. Return structured JSON errors from the start.
+Test 2c — purchaseRequest JSON structure
+Vitest Extract purchaseRequest from the generated form HTML, base64-decode it, parse the JSON. Verify all mandatory 3DS fields are present: email, billAddrCity, billAddrCountry (numeric, e.g. "132"), billAddrLine1, billAddrPostCode (never empty — use "0000" as fallback), acctInfo object with all six sub-fields.
+
+Error to watch Country code sent as alpha-2 ("CV") instead of numeric ("132"). SISP will reject this silently — the payment page loads but the 3DS check fails.
+Test 2d — POST /callback with valid fingerprint
+Vitest + Miniflare Construct a fake SISP callback using the worked-example values from the Security Protocol PDF. Send as application/x-www-form-urlencoded. Assert: HTTP 200, session updated to success, WordPress notification queued via ctx.waitUntil (mock the fetch).
+
+Also assert that merchantResp === "C" AND messageType === "8" are both checked — not just the fingerprint. A mismatched fingerprint that passes the type check should still fail.
+Test 2e — /callback with tampered fingerprint
+Vitest + Miniflare Send a callback where one field (e.g. merchantRespPurchaseAmount) has been changed after fingerprint generation. Assert: HTTP 200 still returned to SISP (always acknowledge), but session status set to failed and WordPress notified with status: "failed" and reason: "fingerprint_mismatch".
+
+Caveat Always return 200 to SISP even on mismatch. If you return 400 or 500, SISP may retry the callback repeatedly, creating duplicate processing attempts.
+Test 2f — amount mismatch
+Vitest + Miniflare Create a session for 500 CVE. Send a callback where fingerprint is valid but merchantRespPurchaseAmount reports 600. Assert session is marked failed with reason amount_mismatch. This is how you catch SISP returning the right signature for the wrong amount — unlikely but in the spec.
+3
+Phase 3 — end-to-end against SISP test environment
+Get SISP test credentials
+Email gestao.operacoes@sisp.cv and request: test POS ID, test POS AUTH CODE, test VBV URL, and test card numbers. They also provide a test environment URL. You cannot do Phase 3 without these — do not try to guess or reuse production credentials.
+
+Important Test card numbers expire. If a test card worked last week and fails now, ask SISP for updated test cards before debugging your code.
+Start wrangler dev with SISP test URL
+wrangler dev Run wrangler dev --local. Wrangler exposes your Worker at http://localhost:8787. For SISP's callback to reach your local machine, you need a public tunnel. Use wrangler dev --remote (deploys to Cloudflare's edge, returns a temporary *.workers.dev URL) or a tunnel tool.
+
+Error to watch wrangler dev --local will not receive SISP's callback POST because SISP cannot reach localhost. Use --remote for end-to-end tests, or set up a tunnel. The callback URL in your payment session must be the public-facing URL, not localhost.
+Test 3a — full payment flow with test card
+Browser + wrangler dev --remote Call POST /create-payment from a browser or curl. Paste the returned formHtml into a blank HTML page and open it — it should auto-submit and redirect to SISP's hosted card page. Enter the test card. After authentication, SISP should POST to your /callback.
+
+Watch the wrangler dev console. You should see the callback request arrive. If it does not arrive within 30 seconds, SISP could not reach your callback URL — check that the URL in the form's urlMerchantResponse field is the public workers.dev URL, not localhost.
+
+Error to watch — silent fingerprint failure If SISP's callback arrives but your Worker logs fingerprint_mismatch, print both the computed fingerprint and the received one to the console. Compare character by character. The most common causes: amount not multiplied by 1000, clearingPeriod not stripped of leading zeros, or reloadCode stripped when it should not be.
+Test 3b — declined card flow
+Browser + SISP test card for decline SISP provides specific test card numbers that trigger declines. Use one. Assert your /callback receives messageType=6, applies the error fingerprint formula (not the success formula), marks the session as failed, and passes the correct error fields to WordPress.
+
+Common mistake Applying the success fingerprint formula to a messageType=6 response. They are different field sets. The error response fingerprint will always fail if you use the success formula — your code will flag every declined payment as a tampered response.
+Test 3c — user cancels on SISP page
+Browser Click cancel/back on the SISP hosted page. SISP will POST to your callback URL with userCancelled=true and NO messageType. Assert your Worker handles this branch: session set to failed, WordPress notified with status: "cancelled". Do not attempt fingerprint validation on a cancel callback — there is no fingerprint sent.
+Test 3d — transaction status API (timeout simulation)
+curl + SISP test env Create a payment session but do NOT complete the payment. After 60 seconds, call your GET /transaction-status?sessionId=.... The Worker should call SISP's /pos/transaction-status API with HTTP Basic auth (base64 of portalId:password — different credentials from POS auth code) and return the result.
+
+Caveat The transaction status API uses different auth than payments. You need PORTAL_ID and PORTAL_PASSWORD as separate Worker secrets. If you reuse POS credentials here, SISP returns 401 with no explanation.
+Phase 4 — WordPress bridge integration
+▼
+Test 4a — WP bridge calls /create-payment and embeds form
+WP staging site + browser Activate the bridge plugin on a staging WooCommerce install. Place an order and reach the payment step. Assert: the bridge sends a POST to your Worker with integer CVE amount (not 25.00 — 2500 for 25 CVE), the Worker responds with formHtml, the bridge embeds and auto-submits the form, and the user lands on the SISP card page.
+
+Caveat — WC amount format $order->get_total() in WooCommerce returns a string like "25.00". Your bridge must cast this to integer CVE before sending to the Worker. If you send 25.00 as-is, the Worker's fingerprint will scale it to 25000 not 25000 — wait, that's the same. But if it comes in as a float string "25.50" the scaling gives 25500 which is correct. The risk is when WC returns locale-formatted amounts like "1.250,00" on some European locales. Always do intval($order->get_total()) in the bridge.
+Test 4b — WP receives payment result and updates order
+WP staging + REST endpoint After a successful test payment (Phase 3a), verify that your WP REST endpoint /wp-json/morabeza/v1/payment-result receives the Worker's POST, validates the X-Secret header, finds the order by orderId, and transitions it to completed. Check the order notes in WP admin — they should include the SISP transaction reference.
+
+Error to watch The WP endpoint must return HTTP 200 to the Worker even if the order update fails (e.g. order not found). If it returns 4xx/5xx, the Worker's ctx.waitUntil fetch fails silently — but more importantly, if you retry on failure you risk double-completing orders.
+Test 4c — X-Secret header validation
+curl POST to your WP REST endpoint without the X-Secret header, then with a wrong value. Both must return HTTP 403 and not update any order. This prevents anyone who discovers your callback URL from faking payment completions.
+
+Then POST with the correct secret and a real order ID in a failed state. Assert the order moves to failed status.
+
+
+Phase 5 — production smoke test
+▼
+Deploy and run a pilot transaction with SISP
+wrangler deploy + SISP Per the migration FAQ (MD044), after integration you must do a pilot transaction in production with SISP present. Contact gestao.operacoes@sisp.cv to schedule this. They validate that your site sends the correct 3DS fields and that the callback fingerprint is verified correctly on your end.
+
+Do not skip this step. SISP only enables international Visa/Mastercard processing after the pilot passes.
+Run a real low-value transaction
+Real card + production POS Use a real card for a 1 CVE or lowest-possible-amount transaction. Verify the order completes end-to-end in WooCommerce. Check D1 to confirm the session record shows status: success. Verify Cloudflare logs show the callback was received and processed without errors.
+Monitor for 48 hours
+Cloudflare Logs + D1 Watch for any fingerprint_mismatch errors — these should be zero on real traffic. Any occurrence means either your crypto implementation has an edge case or someone is tampering. Also watch for sessions stuck in pending — these mean callbacks are not arriving and the transaction-status recovery path needs testing.
+
+Here's the full testing sequence. A few things to read before you click into anything:
+The order matters. Do not touch SISP's test environment until Phase 1 passes completely. Every hour you spend debugging a SISP rejection could just be a wrong raw-binary-vs-hex decision in your SHA-512 implementation. Kill that uncertainty first with the offline unit tests.
+The one test that tells you everything is Test 1a. Feed "123456789A" into your sha512Base64 function. If you get TrmzQzqPgdgicNXUMMKu8p+rtbSoqZDkXeHBZVeZdkyY/BhPZKArQpCJAP4GsPaJbviDg51P8iYlyohDjNr52w==, your crypto is right and everything downstream is buildable. If you get anything else, fix it before writing another line.
+For logging, add this pattern to every callback handler so you always know what went wrong:
+typescriptconst log = {
+  timestamp: new Date().toISOString(),
+  sessionId: formData.get('merchantRespMerchantRef'),
+  messageType: formData.get('messageType'),
+  received: formData.get('resultFingerPrint'),
+  computed: computedFingerprint,
+  match: received === computed,
+  amount_received: formData.get('merchantRespPurchaseAmount'),
+  amount_expected: session?.amount,
+};
+console.log(JSON.stringify(log));
+This lands in Cloudflare's log tail (wrangler tail in dev, Logpush in prod) and gives you exact values to compare when something fails.
+This lands in Cloudflare's log tail (wrangler tail in dev, Logpush in prod) and gives you exact values to compare when something fails.
